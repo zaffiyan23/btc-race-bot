@@ -36,3 +36,19 @@ mechanical stop. Per-sleeve cooldowns; P sits out 60 bars after a thrust
 exit; P and R take no fresh entries around the window's two scheduled US
 prints (~bars 72 and 542). Dev-window grade: net +$4.64, max drawdown
 0.51%; at least one round trip in every 6-hour segment of the dev tape.
+
+## v6 (direction-wait layer)
+
+The sleeves no longer run from the first bar. The bot opens with a
+90-bar observation phase — no trades, it only reads the tape — then
+classifies the day as UP, DOWN or RANGE from the sigma-normalised net
+displacement, and re-reads the direction every 240 bars and immediately
+on a decisive break out of the trailing 150-bar range. UP arms all three
+sleeves as in v5. DOWN disarms T and P (long-only does not buy a revealed
+downtrend) and allows only extra-strict half-size R probes. RANGE disarms
+T and P and allows only small range-edge reversion trades out at
+mid-range. A full v5 thrust gate passing in any regime is itself the
+price showing direction: it flips the read to UP on the spot. Exits are
+never regime-gated. Dev-window grade: net +$6.12, max drawdown 0.47%;
+at least one round trip in every 6-hour segment; time-reversed tape
+-$3.10 with 10 round trips.
