@@ -25,3 +25,14 @@ impact, so the bot only trades moves that are large next to that cost:
 The grader runs `node /bot/main.ts`. Locally, from the kit directory:
 
     node cli/makefun.mjs grade-local --kit . --bot <this repo> --driver process
+
+## v5 (live-first rebuild)
+
+Three sleeves share one position slot, every threshold a multiple of the
+tape's own realised volatility (no fixed-bps triggers fitted to one day):
+T rides vol-scaled thrusts at 75% size, P participates in EMA-aligned
+grinds at 20%, R probes extreme decelerating dips at 10% with a tight
+mechanical stop. Per-sleeve cooldowns; P sits out 60 bars after a thrust
+exit; P and R take no fresh entries around the window's two scheduled US
+prints (~bars 72 and 542). Dev-window grade: net +$4.64, max drawdown
+0.51%; at least one round trip in every 6-hour segment of the dev tape.
