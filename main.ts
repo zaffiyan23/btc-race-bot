@@ -71,6 +71,31 @@
 // trades per window, 15% size, lowest priority. When W2 never fires, the
 // bot is v7 exactly.
 //
+// v4 (this build): a fifth sleeve, D (deep-crash wait), joins on top of
+// hybrid v2 — the owner's corrected reading of yesterday's winner. v3's
+// level-dip arm L bought SHALLOW dips (-1.5%/-2.8% below the anchor) over
+// and over while price fell: 0-for-11 on down days, -$49.42. The owner
+// rejected that outright — catching a falling knife is suicide. D instead
+// WAITS for a genuine crash into a deep zone and only then buys, once,
+// at a price that is actually cheap: with the anchor REF frozen at the
+// end of observation (the close of the first scored bar at/after
+// OBS_BARS), Z1 = REF x (1 - max(4.0%, 6 x sigma60)) — the support shelf,
+// ~62k at a 64.6k REF — and Z2 = REF x (1 - max(7.0%, 10 x sigma60)) —
+// capitulation, ~60k. The sigma terms are widen-only: on a wild tape the
+// zones sit deeper, never shallower than the floors. A close at/below Z1
+// buys 40%; if the first qualifying close is already at/below Z2 (the
+// crash gapped through the shelf between bars) it buys 60%. At most 2 D
+// trades per window, and the second is allowed only at Z2, only after
+// the first has closed. The exit is the winner's hold shape: bank on
+// recovery to REF x (1 - 1.0%), else hold up to 1,200 bars (20 h),
+// protected by a hard stop at -3.0% from the entry close; no trailing
+// stop. Deliberate deviation from the other sleeves: D entries are
+// ALLOWED inside the event windows at both zones — the crash may be the
+// event flush, and that flush is the moment this sleeve exists for. No
+// regime gate either: the depth is the gate. On the dev tape (total
+// range 2.65%) D can never fire, so dev should remain v7's +$7.07
+// exactly. When D never fires, the bot is hybrid v2 exactly.
+//
 // All state comes from the bars themselves: no clock, no randomness, no
 // files, so two runs over the same window answer byte for byte alike.
 
@@ -189,6 +214,21 @@ const W_TRAIL = 0.01;
 const W_STOP = 0.02;
 const W_COOLDOWN = 15; // same sit-out as R after a W exit
 
+/* ---- sleeve D: deep-crash wait (v4) ---- */
+const D_DEPTH1_MIN_BPS = 400; // Z1 depth floor: 4.0% below REF (the support shelf, ~62k at a 64.6k REF)
+const D_DEPTH1_SIGMA_MULT = 6; // widen-only: depth1 = max(400, 6 * sigma60) bps — deeper on wild tapes, never shallower
+const D_DEPTH2_MIN_BPS = 700; // Z2 depth floor: 7.0% below REF (capitulation, ~60k at a 64.6k REF)
+const D_DEPTH2_SIGMA_MULT = 10; // widen-only: depth2 = max(700, 10 * sigma60) bps
+const D_SIZE_PCT = 40; // buy size at Z1
+const D_SIZE_DEEP_PCT = 60; // buy size when the qualifying close is already at/below Z2 (gap-through first trade, and the Z2-only second trade)
+const D_MAX_TRADES = 2; // sleeve buys per window; the second only at Z2, only after the first closed
+const D_RECOVERY_TOL = 0.01; // exit: close back at/above REF x (1 - 1.0%)
+const D_MIN_HOLD = 30; // bars before the recovery exit may fire (hard stop and time stop are not gated)
+const D_TIME_BARS = 1200; // 20 h — the winner's hold
+const D_STOP = 0.03; // hard stop: -3.0% from the entry close
+const D_LATE_CUTOFF = 300; // no fresh D entries in the last 300 bars (a 20 h hold cannot complete)
+const D_COOLDOWN = 15; // same sit-out as R/W after a D exit
+
 const closes: number[] = [];
 const highs: number[] = [];
 const mom15Hist: number[] = [];
@@ -200,7 +240,7 @@ let emaTrend = 0;
 let seeded = false;
 const emaFastHist: number[] = [];
 
-type Sleeve = 'T' | 'P' | 'R' | 'W';
+type Sleeve = 'T' | 'P' | 'R' | 'W' | 'D';
 let sleeve: Sleeve | null = null;
 let peakSinceEntry = 0;
 let entryClose = 0;
@@ -209,10 +249,16 @@ let entrySeq = -1;
 let peakHighW = 0;
 /** W2 only: sleeve buys used this window. */
 let wTradesUsed = 0;
+/** D only: the frozen anchor (close at the end of observation) and the two deep zones below it. 0 until anchored. */
+let dRef = 0;
+let dZone1 = 0;
+let dZone2 = 0;
+/** D only: sleeve buys used this window. */
+let dTradesUsed = 0;
 /** True when the open R position is a RANGE-regime edge trade with a mid-range target. */
 let rangeEntry = false;
 let rangeTarget = 0;
-const exitSeqBy: Record<Sleeve, number> = { T: -1_000_000, P: -1_000_000, R: -1_000_000, W: -1_000_000 };
+const exitSeqBy: Record<Sleeve, number> = { T: -1_000_000, P: -1_000_000, R: -1_000_000, W: -1_000_000, D: -1_000_000 };
 /** v7: consecutive bars the full T gate has passed (two-bar confirmation). */
 let tGateStreak = 0;
 
@@ -353,6 +399,18 @@ await runBars({
     const s60 = sigma(mom60Hist, SIGMA60_FALLBACK, 25);
     const s360 = sigma(mom360Hist, SIGMA360_FALLBACK, 25);
 
+    // Sleeve D anchor: the moment observation ends, freeze the reference
+    // close and the two deep zones below it, using the sigma60 available
+    // at that bar. The sigma terms only ever widen the zones past their
+    // floors. Frozen for the whole window, whatever happens next.
+    if (dRef === 0 && scoredBar >= OBS_BARS) {
+      dRef = close;
+      const depth1 = Math.max(D_DEPTH1_MIN_BPS, D_DEPTH1_SIGMA_MULT * s60) / 10_000;
+      const depth2 = Math.max(D_DEPTH2_MIN_BPS, D_DEPTH2_SIGMA_MULT * s60) / 10_000;
+      dZone1 = dRef * (1 - depth1);
+      dZone2 = dRef * (1 - depth2);
+    }
+
     // The direction layer reads every scored bar, holding or flat: a flip
     // never forces an exit, it only re-arms the entry sleeves.
     updateRegime(scoredBar, close, s15);
@@ -384,6 +442,17 @@ await runBars({
         const tookProfit = heldBars >= W_MIN_HOLD && pnl >= W_TP;
         const trailedW = heldBars >= W_MIN_HOLD && pnl >= W_TRAIL_ACT && peakHighW > 0 && close <= peakHighW * (1 - W_TRAIL);
         exit = stoppedW || tookProfit || trailedW;
+      } else if (sleeve === 'D') {
+        // Sleeve D: the winner's hold shape. Bank on recovery to just
+        // under the frozen anchor (after the minimum hold), hold up to
+        // D_TIME_BARS, and let the -3.0% hard stop be the only protection
+        // against a crash that keeps crashing. No trailing stop: a deep
+        // buy that wobbles on the way back is the trade, not an exit cue.
+        const pnl = entryClose > 0 ? close / entryClose - 1 : 0;
+        const stoppedD = pnl <= -D_STOP;
+        const recovered = heldBars >= D_MIN_HOLD && dRef > 0 && close >= dRef * (1 - D_RECOVERY_TOL);
+        const timedOut = heldBars >= D_TIME_BARS;
+        exit = stoppedD || recovered || timedOut;
       } else {
         // sleeve R (or an untracked position): pulse rules. A range-edge
         // trade also banks at its mid-range target.
@@ -416,6 +485,7 @@ await runBars({
     const cooledP = state.seq - exitSeqBy.P >= COOLDOWN_P;
     const cooledR = state.seq - exitSeqBy.R >= COOLDOWN_R;
     const cooledW = state.seq - exitSeqBy.W >= W_COOLDOWN;
+    const cooledD = state.seq - exitSeqBy.D >= D_COOLDOWN;
     if (m15 === null || m60 === null) return [];
     const eventCaution = inEventWindow(scoredBar);
 
@@ -484,6 +554,29 @@ await runBars({
         if (guardOk && turning && m15 <= R_DOWN_DIP_MULT * s15) {
           return buy(state, R_DOWN_SIZE_PCT, 'R', close);
         }
+      }
+    }
+    // Sleeve D (v4): the deep-crash wait — consulted after T, P and R
+    // pass, before W2. It does nothing at all until price has genuinely
+    // crashed into the frozen deep zones: a close at/below Z1 (the
+    // support shelf, -4.0% or deeper) buys 40%; if that first qualifying
+    // close is already at/below Z2 (capitulation, -7.0% or deeper — the
+    // crash gapped through the shelf between bars) it buys 60%. At most
+    // 2 D trades per window, and the second only at Z2, only after the
+    // first has closed (this block only runs while flat, so a used first
+    // trade is by construction already closed). Two deliberate deviations
+    // from the other sleeves: NO event-window caution (the crash may be
+    // the event flush — that flush is what this sleeve exists for) and
+    // NO regime gate (the depth is the gate; v3's trials showed the
+    // direction read cannot certify a dip anyway, and at -4%/-7% the
+    // certification asked for is the price itself).
+    if (cooledD && dTradesUsed < D_MAX_TRADES && dRef > 0 && scoredBar < WINDOW_BARS - D_LATE_CUTOFF) {
+      const atDeep = close <= dZone2;
+      const atShelf = close <= dZone1;
+      if (atShelf && (dTradesUsed === 0 || atDeep)) {
+        const orders = buy(state, atDeep ? D_SIZE_DEEP_PCT : D_SIZE_PCT, 'D', close);
+        if (orders.length > 0) dTradesUsed += 1;
+        return orders;
       }
     }
     // Sleeve W2 (hybrid v2): the washout dip-buy, lowest priority — it is
