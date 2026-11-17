@@ -52,3 +52,18 @@ price showing direction: it flips the read to UP on the spot. Exits are
 never regime-gated. Dev-window grade: net +$6.12, max drawdown 0.47%;
 at least one round trip in every 6-hour segment; time-reversed tape
 -$3.10 with 10 round trips.
+
+## v7 (live-battery upgrade)
+
+v6 was run cold-start over 33 real unseen days (Coinbase BTC-USD 1-minute
+bars, 2026-10-12 to 2026-11-16, kit fill model): it lost money on 30 of
+them (mean -$4.75/day). The battery's repeated failure modes, fixed here:
+T now needs its full gate to pass on 2 consecutive bars (18 of v6's 43
+thrust trades died within 20 bars for -$76 — one-bar exhaustion pops);
+P additionally requires the 6-hour trend to be up (mom360 > 0) and its
+mom60 death exit is loosened (-0.5 -> -1.0 sigma); R stands down in any
+real 6-hour downtrend (guard -1.3 -> -0.7 sigma), needs a deeper dip
+(-2.2 sigma) and a real bounce (+1.0 sigma) to exit. Dev-window grade:
+net +$7.07, max drawdown 0.47%. Battery after the upgrade: mean -$3.27,
+median -$2.05 per day — still negative on a bearish month; see the build
+log for the full distribution and the honest live estimate.
