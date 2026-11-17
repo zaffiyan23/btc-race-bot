@@ -56,7 +56,31 @@
 // The thrust sleeve is exempt: post-print impulses are exactly its trade.
 // Bar index is bar-derived state, like v4's late cutoff.
 //
-// Hybrid v2 (this build): a fourth sleeve, W2 (washout), joins T/P/R. The
+// v3 (this build): a fifth sleeve, L (level-dip), joins T/P/R/W2. It is a
+// faithful but self-anchored adaptation of the pattern that WON the
+// previous race (btc-race-24h-20261115-0828): @srihandayani's "buy the dip
+// below 65,000 (64,000) — hold up to 20 hours" finished final #1 despite a
+// dev rank of #2,624/2,840, while the dev top-5 fitted schedules collapsed
+// to final #1,300s. The pattern: patient buying at key dip levels, then a
+// long hold. L anchors its levels to the tape itself instead of copying
+// absolute prices: at the end of the observation phase it freezes
+// REF = the close at that moment, and two zones below it, sigma60-scaled
+// with absolute floors — Z1 = REF x (1 - max(1.5%, 3 x sigma60)) and
+// Z2 = REF x (1 - max(2.8%, 5 x sigma60)). A close at/below Z1 buys at
+// 40% size; the exits are the winner's shape, not the pulse sleeves':
+// bank when price recovers to REF x (1 - 0.3%), otherwise hold up to
+// 900 bars, protected only by a hard stop (the tighter of 1.2% below Z2
+// and -4.5% from the entry close). Inside the event blackout windows L
+// may not open at Z1, but MAY open at Z2 — buying the event flush is the
+// winner's whole point, and the deep zone is the compensation. Max 2 L
+// trades per window, no new L entries in the last 240 bars, priority
+// below T/P/R and above W2. L is a level strategy, not a trend strategy,
+// so it ships with no regime gate — the battery showed down-day bleeding,
+// but every candidate gate was tried and rejected on the same battery
+// (each either admits the losers or vetoes the winners; the evidence is
+// in the build log). The hard stop is its only protection.
+//
+// Hybrid v2: a fourth sleeve, W2 (washout), joins T/P/R. The
 // first hybrid test bolted the standalone washout-C rules onto v7 at 15%
 // size, lowest priority, armed in EVERY regime — dev rose to +$8.65, but
 // the 33-day battery got WORSE than v7 (-$3.76 vs -$3.27/day), the damage
@@ -189,6 +213,21 @@ const W_TRAIL = 0.01;
 const W_STOP = 0.02;
 const W_COOLDOWN = 15; // same sit-out as R after a W exit
 
+/* ---- sleeve L: level-dip (v3) ---- */
+const L_SIZE_PCT = 40; // a conviction dip-buy: bigger than the sleeves, below T
+const L_MAX_TRADES = 2; // sleeve buys per window
+const L_DEPTH1_MIN = 0.015; // Z1 depth floor: 1.5% below REF...
+const L_DEPTH1_SIG = 3.0; // ...or 3 x sigma60 (bps), whichever is deeper
+const L_DEPTH2_MIN = 0.028; // Z2 depth floor: 2.8% below REF...
+const L_DEPTH2_SIG = 5.0; // ...or 5 x sigma60 (bps), whichever is deeper
+const L_RECOVERY_TOL = 0.003; // exit: close back at/above REF x (1 - 0.3%)
+const L_MIN_HOLD = 30; // bars before the recovery exit may fire (no instant flips)
+const L_TIME_BARS = 900; // time stop: the winner held up to ~20 h; 900 bars = 15 h
+const L_STOP_BELOW_Z2 = 0.012; // hard stop leg 1: 1.2% below the deep zone
+const L_STOP_MAX_DROP = 0.045; // hard stop leg 2: -4.5% from the entry close (the tighter of the two binds)
+const L_LATE_CUTOFF = 240; // no new L entries in the last 240 bars (a 900-bar hold cannot complete)
+const L_COOLDOWN = 30; // sit-out after an L exit
+
 const closes: number[] = [];
 const highs: number[] = [];
 const mom15Hist: number[] = [];
@@ -200,7 +239,7 @@ let emaTrend = 0;
 let seeded = false;
 const emaFastHist: number[] = [];
 
-type Sleeve = 'T' | 'P' | 'R' | 'W';
+type Sleeve = 'T' | 'P' | 'R' | 'W' | 'L';
 let sleeve: Sleeve | null = null;
 let peakSinceEntry = 0;
 let entryClose = 0;
@@ -209,10 +248,18 @@ let entrySeq = -1;
 let peakHighW = 0;
 /** W2 only: sleeve buys used this window. */
 let wTradesUsed = 0;
+/** L only: the frozen anchor (close at the end of observation) and the two dip zones below it. 0 until anchored. */
+let refPrice = 0;
+let zone1 = 0;
+let zone2 = 0;
+/** L only: hard-stop price level for the open L position (set at entry). */
+let lStopLevel = 0;
+/** L only: sleeve buys used this window. */
+let lTradesUsed = 0;
 /** True when the open R position is a RANGE-regime edge trade with a mid-range target. */
 let rangeEntry = false;
 let rangeTarget = 0;
-const exitSeqBy: Record<Sleeve, number> = { T: -1_000_000, P: -1_000_000, R: -1_000_000, W: -1_000_000 };
+const exitSeqBy: Record<Sleeve, number> = { T: -1_000_000, P: -1_000_000, R: -1_000_000, W: -1_000_000, L: -1_000_000 };
 /** v7: consecutive bars the full T gate has passed (two-bar confirmation). */
 let tGateStreak = 0;
 
@@ -357,6 +404,19 @@ await runBars({
     // never forces an exit, it only re-arms the entry sleeves.
     updateRegime(scoredBar, close, s15);
 
+    // Sleeve L anchor: the moment observation ends, freeze the reference
+    // close and the two dip zones below it for the whole window. The
+    // depths are sigma60-scaled with absolute floors, computed from the
+    // sigma60 available at this bar, then never moved again — a level
+    // that drifts is not a level.
+    if (refPrice === 0 && scoredBar >= OBS_BARS) {
+      refPrice = close;
+      const d1 = Math.max(L_DEPTH1_MIN, (L_DEPTH1_SIG * s60) / 10_000);
+      const d2 = Math.max(L_DEPTH2_MIN, (L_DEPTH2_SIG * s60) / 10_000);
+      zone1 = refPrice * (1 - d1);
+      zone2 = refPrice * (1 - d2);
+    }
+
     if (qty > 0n) {
       // Riding a position: guard the exits of whichever sleeve opened it.
       if (close > peakSinceEntry) peakSinceEntry = close;
@@ -384,6 +444,15 @@ await runBars({
         const tookProfit = heldBars >= W_MIN_HOLD && pnl >= W_TP;
         const trailedW = heldBars >= W_MIN_HOLD && pnl >= W_TRAIL_ACT && peakHighW > 0 && close <= peakHighW * (1 - W_TRAIL);
         exit = stoppedW || tookProfit || trailedW;
+      } else if (sleeve === 'L') {
+        // Sleeve L: the winner's hold shape. No trailing stop at all.
+        // Bank on recovery to just under the anchor (after the minimum
+        // hold), leave on the 900-bar time stop, and let the hard stop
+        // (a fixed price level set at entry) be the only protection.
+        const stoppedL = lStopLevel > 0 && close <= lStopLevel;
+        const recovered = heldBars >= L_MIN_HOLD && refPrice > 0 && close >= refPrice * (1 - L_RECOVERY_TOL);
+        const staleL = heldBars >= L_TIME_BARS;
+        exit = stoppedL || recovered || staleL;
       } else {
         // sleeve R (or an untracked position): pulse rules. A range-edge
         // trade also banks at its mid-range target.
@@ -402,6 +471,7 @@ await runBars({
         rangeEntry = false;
         rangeTarget = 0;
         peakHighW = 0;
+        lStopLevel = 0;
         return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
@@ -416,6 +486,7 @@ await runBars({
     const cooledP = state.seq - exitSeqBy.P >= COOLDOWN_P;
     const cooledR = state.seq - exitSeqBy.R >= COOLDOWN_R;
     const cooledW = state.seq - exitSeqBy.W >= W_COOLDOWN;
+    const cooledL = state.seq - exitSeqBy.L >= L_COOLDOWN;
     if (m15 === null || m60 === null) return [];
     const eventCaution = inEventWindow(scoredBar);
 
@@ -486,8 +557,38 @@ await runBars({
         }
       }
     }
+    // Sleeve L (v3): the level-dip, priority below T/P/R and above W2.
+    // Patient, like the pattern it adapts: a close at or below the
+    // shallow zone buys 40% and then simply holds for the recovery, the
+    // time stop, or the hard stop. Inside the event blackout windows the
+    // shallow zone is closed to it — but the deep zone stays open even
+    // there: buying the event flush at the deep level is the winner's
+    // whole point, and the extra depth is the compensation for the risk.
+    // No regime or momentum gate, as designed — and the build log
+    // documents why: on the 33-day battery the arm bleeds on down days
+    // (11 trades, -$49.42), but every gate tried (a mom360 waterfall
+    // veto, a not-DOWN veto, a RANGE-only habitat gate) either admits
+    // the same losers or vetoes the flat-day winners, because at a
+    // >= 1.5% dip the winner/loser distributions of every available
+    // signal fully overlap. The arm ships unguarded, exactly as
+    // specified; the hard stop is its only protection.
+    if (cooledL && lTradesUsed < L_MAX_TRADES && refPrice > 0 && scoredBar < WINDOW_BARS - L_LATE_CUTOFF) {
+      const atDeep = close <= zone2;
+      const atShallow = close <= zone1;
+      if (atDeep || (atShallow && !eventCaution)) {
+        const orders = buy(state, L_SIZE_PCT, 'L', close);
+        if (orders.length > 0) {
+          lTradesUsed += 1;
+          // Hard stop: the tighter (higher) of 1.2% below the deep zone
+          // (the level thesis is broken) and -4.5% from the entry close
+          // (the disaster cap, binding when sigma blew the zones wide).
+          lStopLevel = Math.max(zone2 * (1 - L_STOP_BELOW_Z2), close * (1 - L_STOP_MAX_DROP));
+        }
+        return orders;
+      }
+    }
     // Sleeve W2 (hybrid v2): the washout dip-buy, lowest priority — it is
-    // only consulted when T, P and R all passed. The entry is the
+    // only consulted when T, P, R and L all passed. The entry is the
     // standalone washout rule (close >= 1.8% under the trailing 60-bar
     // high, freefall filter on), but hybrid v1's regime-blind arming is
     // replaced by three gates from v7's own machinery:

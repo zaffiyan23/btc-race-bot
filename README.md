@@ -67,3 +67,23 @@ real 6-hour downtrend (guard -1.3 -> -0.7 sigma), needs a deeper dip
 net +$7.07, max drawdown 0.47%. Battery after the upgrade: mean -$3.27,
 median -$2.05 per day — still negative on a bearish month; see the build
 log for the full distribution and the honest live estimate.
+
+## v3 (level-dip arm L, on top of hybrid v2)
+
+A fifth sleeve adapts the pattern that won the previous race ("buy the
+dip below key levels, hold up to ~20 hours"): at the end of the
+observation phase the bot freezes REF (that bar's close) and two zones
+below it, Z1 = REF x (1 - max(1.5%, 3 sigma60)) and Z2 = REF x
+(1 - max(2.8%, 5 sigma60)). A close at/below Z1 buys at 40% size (the
+deep zone stays open even inside the event blackout windows; the
+shallow zone does not). Exits are the winner's shape: bank on recovery
+to REF x (1 - 0.3%) after a 30-bar minimum hold, a 900-bar time stop,
+and a hard stop at the tighter of 1.2% below Z2 and -4.5% from entry.
+Dev-window grade: net +$4.66 (the L trade itself made +$5.09 but held
+the slot through the start of the dev spike, costing more than it
+made). Battery: mean -$4.04/day, worse than hybrid v2's -$3.22 — the
+arm went 6-for-6 on up/flat days (+$26.20) and 0-for-11 on down days
+(-$49.42), and every candidate gate tried (mom360 veto, not-DOWN veto,
+RANGE-only) either admitted the losers or vetoed the winners. v3 fails
+its acceptance bar; hybrid v2 remains the stronger build. Full numbers
+in the build log.
