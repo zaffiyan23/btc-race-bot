@@ -84,11 +84,18 @@ const T_TIME_BARS = 45; // a thrust must prove itself within this many bars
 const T_TIME_MULT = 0.5; // ...unless it is ahead by this x sigma15
 const T_SIZE_PCT = 75;
 const T_LATE_CUTOFF = 180;
+/** v7 (33-day live battery): the full thrust gate must pass on this many
+ * consecutive bars before T enters. On real tapes 18 of 43 v6 thrust
+ * trades died within 20 bars for -$76 — one-bar exhaustion pops inside
+ * downtrends. A genuine impulse sustains for many bars, so a one-bar
+ * confirmation delay costs almost nothing on real moves and filters the
+ * pops. The dev spike (15+ minutes) passes trivially. */
+const T_CONFIRM_BARS = 2;
 
 /* ---- sleeve P: participation ---- */
 const P_THR_MULT = 0.25; // entry: mom60 >= this x sigma60, inside an EMA-aligned uptrend
 const P_EXT_MULT = 1.0; // ...but mom15 no more than this x sigma15 (do not buy the vertical bar) // entry: mom60 >= P_THR_MULT * sigma60 (a real trend, not a wiggle)
-const P_DEATH_MULT = -0.5; // exit: mom60 <= P_DEATH_MULT * sigma60
+const P_DEATH_MULT = -1.0; // exit: mom60 <= P_DEATH_MULT * sigma60 (v7: was -0.5 — battery showed it strangled winners on noise; avg P win was $0.19 vs avg loss -$0.55)
 const P_TRAIL_MULT = 3.2; // exit: trailing stop, x sigma15 (bps, clamped)
 const P_TRAIL_MIN = 55;
 const P_TRAIL_MAX = 150;
@@ -97,14 +104,14 @@ const P_SIZE_PCT = 20;
 const P_LATE_CUTOFF = 150;
 
 /* ---- sleeve R: reversion pulse ---- */
-const R_DIP_MULT = -1.9; // entry: mom15 <= R_DIP_MULT * sigma15
-const R_BOUNCE_MULT = 0.9; // exit: mom15 >= R_BOUNCE_MULT * sigma15
+const R_DIP_MULT = -2.2; // entry: mom15 <= R_DIP_MULT * sigma15 (v7: was -1.9 — battery: 129 R trades at -$0.155 expectancy; shallower dips in a downtrend month are the trend, not the exception)
+const R_BOUNCE_MULT = 1.0; // exit: mom15 >= R_BOUNCE_MULT * sigma15 (v7: was 0.9 — demand a real bounce, not an uptick that cannot cover costs)
 const R_STOP_MULT = 0.75; // exit: hard stop, x sigma15 below entry (bps, clamped)
 const R_STOP_MIN = 15;
 const R_STOP_MAX = 40;
 const R_GUARD60_MULT = -1.6; // no dip-buying when mom60 <= this x sigma60
-const R_GUARD360_MULT = -1.3; // ...or mom360 <= this x sigma360 (when measurable)
-const R_TIME_BARS = 24; // a pulse that has not bounced by now is done
+const R_GUARD360_MULT = -0.7; // ...or mom360 <= this x sigma360 (when measurable) (v7: was -1.3 — stand down in any real 6h downtrend, not only waterfalls)
+const R_TIME_BARS = 30; // a pulse that has not bounced by now is done (v7: was 24, paired with the higher bounce bar)
 const R_SIZE_PCT = 10;
 const R_LATE_CUTOFF = 40;
 
@@ -129,7 +136,7 @@ const R_DOWN_DIP_MULT = -2.6;
 const R_DOWN_DECEL_BPS = 3;
 /** ...and stricter waterfall guards, at half size. */
 const R_DOWN_GUARD60_MULT = -1.2;
-const R_DOWN_GUARD360_MULT = -0.9;
+const R_DOWN_GUARD360_MULT = -0.5; // (v7: was -0.9, same stand-down logic as R_GUARD360)
 const R_DOWN_SIZE_PCT = 5;
 
 /* ---- shared ---- */
@@ -169,6 +176,8 @@ let entrySeq = -1;
 let rangeEntry = false;
 let rangeTarget = 0;
 const exitSeqBy: Record<Sleeve, number> = { T: -1_000_000, P: -1_000_000, R: -1_000_000 };
+/** v7: consecutive bars the full T gate has passed (two-bar confirmation). */
+let tGateStreak = 0;
 
 type Regime = 'OBS' | 'UP' | 'DOWN' | 'RANGE';
 let regime: Regime = 'OBS';
@@ -365,15 +374,18 @@ await runBars({
     // UP on the spot (a range break needs the close beyond the range edge;
     // a violent impulse from inside the range would otherwise be read too
     // late). The gate is the whole v5 filter — nothing is relaxed.
-    if (cooledT && scoredBar < WINDOW_BARS - T_LATE_CUTOFF && closes.length > EMA_TREND_SPAN) {
-      const thrust = clamp(T_THR_MULT * s15, T_THR_MIN, T_THR_MAX);
-      if (m15 >= thrust && m60 >= T_SLOW_MULT * s60 && close > emaTrend) {
-        if (regime !== 'UP') {
-          regime = 'UP';
-          lastClassBar = scoredBar;
-        }
-        return buy(state, T_SIZE_PCT, 'T', close);
+    // v7: the gate is evaluated every flat bar to maintain the confirmation
+    // streak; entry (and the regime flip it carries) needs T_CONFIRM_BARS
+    // consecutive passes, so a one-bar exhaustion pop never gets bought.
+    const tGate = closes.length > EMA_TREND_SPAN && m15 >= clamp(T_THR_MULT * s15, T_THR_MIN, T_THR_MAX) && m60 >= T_SLOW_MULT * s60 && close > emaTrend;
+    tGateStreak = tGate ? tGateStreak + 1 : 0;
+    if (cooledT && tGateStreak >= T_CONFIRM_BARS && scoredBar < WINDOW_BARS - T_LATE_CUTOFF) {
+      if (regime !== 'UP') {
+        regime = 'UP';
+        lastClassBar = scoredBar;
       }
+      tGateStreak = 0;
+      return buy(state, T_SIZE_PCT, 'T', close);
     }
     // Sleeve P: participation in a rising grind. The bar is regime, not
     // magnitude: fast EMA above the trend EMA and rising, price above
@@ -381,7 +393,10 @@ await runBars({
     // what they show is alignment that persists. UP days only.
     if (regime === 'UP' && cooledP && state.seq - exitSeqBy.T >= POST_T_P_BLOCK && !eventCaution && scoredBar < WINDOW_BARS - P_LATE_CUTOFF && closes.length > EMA_TREND_SPAN) {
       const emaRising = emaFastHist.length > 30 && emaFast > emaFastHist[emaFastHist.length - 31];
-      if (m60 >= P_THR_MULT * s60 && m15 <= P_EXT_MULT * s15 && m15 >= -0.5 * s15 && close > emaTrend && emaFast > emaTrend && emaRising) {
+      // v7: P also needs the 6-hour trend itself to be up (mom360 > 0 when
+      // measurable). Battery: P won 6% of 87 trades — EMA alignment inside
+      // a falling 6h trend is a bear-market bounce, not a grind.
+      if (m60 >= P_THR_MULT * s60 && m15 <= P_EXT_MULT * s15 && m15 >= -0.5 * s15 && close > emaTrend && emaFast > emaTrend && emaRising && (m360 === null || m360 > 0)) {
         return buy(state, P_SIZE_PCT, 'P', close);
       }
     }
