@@ -56,6 +56,21 @@
 // The thrust sleeve is exempt: post-print impulses are exactly its trade.
 // Bar index is bar-derived state, like v4's late cutoff.
 //
+// Hybrid v2 (this build): a fourth sleeve, W2 (washout), joins T/P/R. The
+// first hybrid test bolted the standalone washout-C rules onto v7 at 15%
+// size, lowest priority, armed in EVERY regime — dev rose to +$8.65, but
+// the 33-day battery got WORSE than v7 (-$3.76 vs -$3.27/day), the damage
+// concentrated on down days (-$3.67 vs -$2.36): a regime-blind dip sleeve
+// re-imports the knife-catching v7's own guards exist to prevent. W2 keeps
+// the washout entry (drop >= 1.8% from the trailing 60-bar high, freefall
+// filter on) but gates it with v7's own machinery: (a) it may fire only
+// when the direction layer does NOT read DOWN (UP or RANGE only); (b) R's
+// waterfall guards (mom60 and mom360 vs their sigma multiples) must also
+// pass, so a mid-crash leg cannot trigger it inside a stale non-DOWN read;
+// (c) the P/R event blackout windows apply to it too. At most 2 sleeve
+// trades per window, 15% size, lowest priority. When W2 never fires, the
+// bot is v7 exactly.
+//
 // All state comes from the bars themselves: no clock, no randomness, no
 // files, so two runs over the same window answer byte for byte alike.
 
@@ -157,7 +172,25 @@ const EVENT_WINDOWS: ReadonlyArray<readonly [number, number]> = [
 /** Widest gap between the latest close and the fill open an order accepts. */
 const MAX_SLIPPAGE_BPS = 150;
 
+/* ---- sleeve W2: washout dip-buy (hybrid v2) ---- */
+const W_DROP = 0.018; // entry: close at least 1.8% below the trailing 60-bar high
+const W_LOOKBACK = 60; // trailing bars for the reference high (bar highs, current bar included)
+const W_SIZE_PCT = 15;
+const W_MAX_TRADES = 2; // sleeve buys per window
+const W_MIN_HOLD = 8; // bars before TP / trailing exits may fire (hard stop is immediate)
+/** Freefall filter (the washout rule's own): skip when the last 3 closes fall strictly and steeply. */
+const W_FREEFALL_3BAR = 0.012;
+/* Exit set E (default; the tighter set with the best battery tail in the
+ * standalone trials): TP +1.4%, trail 1.0% off the best high once up +0.5%,
+ * hard stop -2.0%. The C exit set is TP 1.8% / act 0.6% / trail 1.3%. */
+const W_TP = 0.014;
+const W_TRAIL_ACT = 0.005;
+const W_TRAIL = 0.01;
+const W_STOP = 0.02;
+const W_COOLDOWN = 15; // same sit-out as R after a W exit
+
 const closes: number[] = [];
+const highs: number[] = [];
 const mom15Hist: number[] = [];
 const mom60Hist: number[] = [];
 const mom360Hist: number[] = [];
@@ -167,15 +200,19 @@ let emaTrend = 0;
 let seeded = false;
 const emaFastHist: number[] = [];
 
-type Sleeve = 'T' | 'P' | 'R';
+type Sleeve = 'T' | 'P' | 'R' | 'W';
 let sleeve: Sleeve | null = null;
 let peakSinceEntry = 0;
 let entryClose = 0;
 let entrySeq = -1;
+/** W2 only: highest bar HIGH since the entry signal bar (its trailing stop rides highs, as in the standalone washout). */
+let peakHighW = 0;
+/** W2 only: sleeve buys used this window. */
+let wTradesUsed = 0;
 /** True when the open R position is a RANGE-regime edge trade with a mid-range target. */
 let rangeEntry = false;
 let rangeTarget = 0;
-const exitSeqBy: Record<Sleeve, number> = { T: -1_000_000, P: -1_000_000, R: -1_000_000 };
+const exitSeqBy: Record<Sleeve, number> = { T: -1_000_000, P: -1_000_000, R: -1_000_000, W: -1_000_000 };
 /** v7: consecutive bars the full T gate has passed (two-bar confirmation). */
 let tGateStreak = 0;
 
@@ -287,8 +324,10 @@ await runBars({
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
     if (bar === undefined) return [];
     const close = Number(bar.c);
+    const high = Number(bar.h);
     const prevClose = closes.length > 0 ? closes[closes.length - 1] : close;
     closes.push(close);
+    highs.push(high);
     if (!seeded) {
       emaFast = close;
       emaTrend = close;
@@ -321,6 +360,7 @@ await runBars({
     if (qty > 0n) {
       // Riding a position: guard the exits of whichever sleeve opened it.
       if (close > peakSinceEntry) peakSinceEntry = close;
+      if (sleeve === 'W' && high > peakHighW) peakHighW = high;
       const heldBars = entrySeq >= 0 ? state.seq - entrySeq : 0;
       let exit = false;
       if (sleeve === 'T') {
@@ -334,6 +374,16 @@ await runBars({
         const trailed = peakSinceEntry > 0 && close <= peakSinceEntry * (1 - clamp(P_TRAIL_MULT * s15, P_TRAIL_MIN, P_TRAIL_MAX) / 10_000);
         const stale = heldBars >= P_TIME_BARS;
         exit = trendBroke || death || trailed || stale;
+      } else if (sleeve === 'W') {
+        // Sleeve W2: the standalone washout exits, measured on closes vs
+        // the entry signal close. Hard stop is immediate; take-profit and
+        // the trailing stop (off the best bar high since entry) wait for
+        // the minimum hold, exactly as in the standalone rules.
+        const pnl = entryClose > 0 ? close / entryClose - 1 : 0;
+        const stoppedW = pnl <= -W_STOP;
+        const tookProfit = heldBars >= W_MIN_HOLD && pnl >= W_TP;
+        const trailedW = heldBars >= W_MIN_HOLD && pnl >= W_TRAIL_ACT && peakHighW > 0 && close <= peakHighW * (1 - W_TRAIL);
+        exit = stoppedW || tookProfit || trailedW;
       } else {
         // sleeve R (or an untracked position): pulse rules. A range-edge
         // trade also banks at its mid-range target.
@@ -351,6 +401,7 @@ await runBars({
         entrySeq = -1;
         rangeEntry = false;
         rangeTarget = 0;
+        peakHighW = 0;
         return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
@@ -364,6 +415,7 @@ await runBars({
     const cooledT = state.seq - exitSeqBy.T >= COOLDOWN_T;
     const cooledP = state.seq - exitSeqBy.P >= COOLDOWN_P;
     const cooledR = state.seq - exitSeqBy.R >= COOLDOWN_R;
+    const cooledW = state.seq - exitSeqBy.W >= W_COOLDOWN;
     if (m15 === null || m60 === null) return [];
     const eventCaution = inEventWindow(scoredBar);
 
@@ -431,6 +483,45 @@ await runBars({
         const turning = close >= prevClose && lastM15 !== null && m15 >= lastM15 + R_DOWN_DECEL_BPS;
         if (guardOk && turning && m15 <= R_DOWN_DIP_MULT * s15) {
           return buy(state, R_DOWN_SIZE_PCT, 'R', close);
+        }
+      }
+    }
+    // Sleeve W2 (hybrid v2): the washout dip-buy, lowest priority — it is
+    // only consulted when T, P and R all passed. The entry is the
+    // standalone washout rule (close >= 1.8% under the trailing 60-bar
+    // high, freefall filter on), but hybrid v1's regime-blind arming is
+    // replaced by three gates from v7's own machinery:
+    //   (a) regime gate: never in a DOWN read (UP or RANGE only) — a
+    //       revealed downtrend is where dip-buying bleeds;
+    //   (b) waterfall guard: R's own guards must pass (mom60 above
+    //       R_GUARD60_MULT x sigma60 and mom360 above R_GUARD360_MULT x
+    //       sigma360 when measurable), so a mid-crash leg cannot trigger
+    //       the sleeve inside a stale UP/RANGE read either;
+    //   (c) event blackout: no entries inside the P/R event windows.
+    // Exits are never gated: a W position is guarded by the washout exits
+    // whatever the read does next.
+    if (regime !== 'DOWN' && !eventCaution && cooledW && wTradesUsed < W_MAX_TRADES && closes.length >= W_LOOKBACK) {
+      const guardOk = m60 > R_GUARD60_MULT * s60 && (m360 === null || m360 > R_GUARD360_MULT * s360);
+      if (guardOk) {
+        let recentHigh = 0;
+        for (let i = highs.length - W_LOOKBACK; i < highs.length; i++) {
+          if (highs[i] > recentHigh) recentHigh = highs[i];
+        }
+        const drop = recentHigh > 0 ? (recentHigh - close) / recentHigh : 0;
+        let freefall = false;
+        if (closes.length >= 3) {
+          const c0 = closes[closes.length - 3];
+          const c1 = closes[closes.length - 2];
+          const c2 = closes[closes.length - 1];
+          freefall = c0 > c1 && c1 > c2 && c0 > 0 && (c0 - c2) / c0 > W_FREEFALL_3BAR;
+        }
+        if (drop >= W_DROP && !freefall) {
+          const orders = buy(state, W_SIZE_PCT, 'W', close);
+          if (orders.length > 0) {
+            peakHighW = close;
+            wTradesUsed += 1;
+          }
+          return orders;
         }
       }
     }
